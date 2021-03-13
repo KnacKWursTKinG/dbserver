@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+
+import base64
+import json
+import os
+import sys
+
+from dataclasses import dataclass
+
+import click
+import requests
+
+
+@dataclass
+class _Setup:
+    url: str
+    credentials: bytes
+
+    host: str = os.getenv('DBSERVER', 'localhost')
+    port: int = 50565
+
+
+Setup: _Setup
+
+
+def jprint(r: requests.get) -> None:
+    if not r.headers.get('Content-Type') == 'application/json':
+        click.echo(f"sdbcli: Got unexpected Content-Type: {r.headers['Content-Type']}", err=True)
+        click.echo(f"{r.content.decode('utf-8')}", err=True)
+        return
+
+    try:
+        click.echo(json.dumps(json.loads(r.content.decode('utf-8')), indent=2))
+    except json.JSONDecodeError as ex:
+        click.echo(f"sdbcli: JSONDecodeError: {ex}", err=True)
+
+
+# <<- Entry Point
+@click.group()
+@click.option('-h', '--host', nargs=1, type=str, metavar="<host>",
+              default=os.getenv('DBSERVER', 'localhost'), show_default=True)
+@click.option('-p', '--port', nargs=1, type=int, metavar="<port>", default=50565, show_default=True)
+def cli(**kwargs):
+    """ A simple DBServer client. (return always JSON data and for the get request also Bytes)
+
+    Environment variable 'DBAUTH' have to be set.
+    >>> export DBAUTH="user:password"
+
+    Notes:
+        * Group: a group contains Labels
+        * Label: a Label contains data (bytes only)
+
+    Use the 'jq' tool for colored json output
+    >>> sdbcli get -g test | jq
+    """
+    global Setup
+
+    if not os.getenv('DBAUTH'):
+        click.echo("sdbcli: DBAUTH environment variable missing!", err=True)
+        sys.exit(1)
+
+    Setup = _Setup(
+        url=f"http://{kwargs['host']}:{kwargs['port']}/",
+        credentials=base64.b64encode(os.getenv('DBAUTH').encode('utf-8'))
+    )
+# ->>
+
+
+# <<- click.command: 'get'
+@cli.command('get')
+@click.option('-g', '--group', type=str, nargs=1, metavar="<group>")
+@click.option('-l', '--label', type=str, nargs=1, metavar="<label>")
+@click.option(
+    '-o', '--output', type=click.Path(
+        exists=False, file_okay=True, dir_okay=False, writable=True, allow_dash=True
+    ), metavar="<output-file>"
+)
+@click.option('--decode', is_flag=True, show_default=True)
+@click.option('--decode-format', type=str, default='utf-8', show_default=True, metavar="<format>")
+def db_get(**kwargs):
+    """ Get request to server.
+
+    Get groups labels or label data from the server.
+
+    For getting data from the server you need '-g ... -l ... -o ...'
+    """
+    try:
+        if not kwargs['group'] and not kwargs['label']:
+            # get groups from server
+            r = requests.get(
+                Setup.url + 'db', headers={
+                    "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+                }
+            )
+            jprint(r)
+
+            if r.status_code == 200:
+                sys.exit(0)
+
+            sys.exit(1)
+
+        elif not kwargs['label'] and kwargs['group']:
+            # get labels for group from server
+            r = requests.get(
+                Setup.url + f"db/{kwargs['group']}", headers={
+                    "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+                }
+            )
+            jprint(r)
+
+            if r.status_code == 200:
+                sys.exit(0)
+
+            sys.exit(1)
+
+        elif kwargs['label'] and kwargs['group']:
+            # get label data from server, create json response and pipe data into a file given
+            if kwargs['output']:
+                r = requests.get(
+                    Setup.url + f"db/{kwargs['group']}/{kwargs['label']}", headers={
+                        "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+                    }
+                )
+
+                if r.status_code != 200:  # NOTE: bytes data expected
+                    click.echo(f"dbserver: {json.loads(r.content.decode('utf-8'))['error']}", err=True)
+                    sys.exit(1)
+
+                if r.headers.get('Content-Type') == 'data/bytes':
+                    if kwargs['decode']:
+                        content = r.content.decode(kwargs['decode_format'])
+                    else:
+                        content = r.content
+
+                    #if kwargs['output'] == '-':  # TODO remove
+                    #    if not os.path.exists('/dev/stdout'):
+                    #        click.echo("Cannot write to '/dev/stdout'", err=True)
+                    #        sys.exit(1)
+
+                    #    kwargs['output'] = '/dev/stdout'
+
+                    #with open(kwargs['output'], 'w' if kwargs['decode'] else 'wb') as file:
+                    with click.open_file(kwargs['output'], 'w' if kwargs['decode'] else 'wb') as file:
+                        file.write(content)
+
+                    sys.exit(0)
+
+                else:
+                    # unknown content type
+                    click.echo(f"sdbcli: Unknown Content-Type: {r.headers['Content-Type']}", err=True)
+                    sys.exit(1)
+
+            else:
+                # no output specified, return json error: 'sdbcli: missing output location for data'
+                click.echo("sdbcli: Missing output location for data (`--output ...`)", err=True)
+                sys.exit(1)
+
+        else:
+            click.echo("sdbcli: Nothing to do! (`--help` for more info)", err=True)
+            sys.exit(1)
+
+    except requests.exceptions.ConnectionError as ex:
+        click.echo(f"sdbcli: ConnectionError: {ex}", err=True)
+        sys.exit(1)
+# ->>
+
+
+# <<- click.command: 'post'
+@cli.command('post')
+@click.option(
+    '-f', '--file', type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True, allow_dash=True
+    ), default='-', metavar="<file>"
+)
+@click.argument('group', type=str, metavar="<group>")
+@click.argument('label', type=str, metavar="<label>")
+def db_post(**kwargs):
+    """ Post request to server
+
+    /b
+    Create a new 'Label' inside a 'Group'
+    Set a file to read from or read from pipe per default
+    """
+    def get_data():
+        with click.open_file(kwargs['file'], 'rb') as file:
+            return file.read()
+
+    r = requests.post(
+        Setup.url + f"db/{kwargs['group']}/{kwargs['label']}", data=get_data(),
+        headers={
+            "Content-Type": "data/bytes",
+            "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+        }
+    )
+
+    jprint(r)
+
+    if r.status_code != 200:
+        sys.exit(1)
+
+    sys.exit(0)
+# ->>
+
+
+# <<- click.command: 'put'
+@cli.command('put')
+@click.option(
+    '-f', '--file', type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True, allow_dash=True
+    ), default='-', metavar="<file>"
+)
+@click.argument('group', type=str, metavar="<group>")
+@click.argument('label', type=str, metavar="<label>")
+def db_put(**kwargs):
+    """ Put request to server
+
+    \b
+    Change 'Label' data
+    Set a file to read from or read from pipe per default
+    """
+    def get_data():
+        with click.open_file(kwargs['file'], 'rb') as file:
+            return file.read()
+
+    r = requests.put(
+        Setup.url + f"db/{kwargs['group']}/{kwargs['label']}", data=get_data(),
+        headers={
+            "Content-Type": "data/bytes",
+            "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+        }
+    )
+
+    jprint(r)
+
+    if r.status_code != 200:
+        sys.exit(1)
+
+    sys.exit(0)
+# ->>
+
+
+# <<- click.command: 'delete'
+@cli.command('delete')
+@click.option('-g', '--group', type=str, nargs=1, metavar="<group>")
+@click.option('-l', '--label', type=str, nargs=1, metavar="<label>")
+def db_delete(**kwargs):
+    """ Delete request to server """
+    if kwargs['group'] and kwargs['label']:
+        to_delete = f"db/{kwargs['group']}/{kwargs['label']}"
+
+    elif kwargs['group']:
+        to_delete = f"db/{kwargs['group']}"
+
+    else:
+        click.echo("sdbcli: No group or/and label given", err=True)
+        sys.exit(1)
+
+    r = requests.delete(
+        Setup.url + to_delete, headers={
+            "Authorization": f"Basic {str(Setup.credentials, 'utf-8')}"
+        }
+    )
+
+    jprint(r)
+
+    if r.status_code != 200:
+        sys.exit(1)
+
+    sys.exit(0)
+# ->>
+
+
+if __name__ == "__main__":
+    cli()
